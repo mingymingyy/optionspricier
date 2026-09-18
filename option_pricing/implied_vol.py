@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from black_scholes import bs_price, vega
+from .black_scholes import bs_price, vega
 
 __all__ = [
     "ImpliedVolError",

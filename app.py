@@ -1,9 +1,14 @@
-"""Options analytics dashboard: Black-Scholes pricing, implied vol, and scenarios.
+"""Options analytics dashboard.
+
+Three pricing models on one contract, plus Greeks, implied volatility and
+scenario analysis.
 
 Run with:  streamlit run app.py
 """
 
 from __future__ import annotations
+
+from datetime import date, timedelta
 
 import altair as alt
 import numpy as np
@@ -11,8 +16,9 @@ import pandas as pd
 import streamlit as st
 from scipy.stats import norm
 
-from black_scholes import bs_price, d1_d2, scaled_greeks, vega
-from implied_vol import ImpliedVolError, implied_vol, price_bounds
+from option_pricing import binomial, market_data, monte_carlo
+from option_pricing.black_scholes import bs_price, d1_d2, scaled_greeks, vega
+from option_pricing.implied_vol import ImpliedVolError, implied_vol, price_bounds
 
 st.set_page_config(
     page_title="Options pricer",
@@ -26,32 +32,85 @@ DAYS_PER_YEAR = 365.0
 # Below roughly 1 cent of P&L per vol point, an implied vol is noise.
 VEGA_RELIABILITY_FLOOR = 0.01
 
-
-# Widget values cannot be written after the widget exists, so the "use this IV"
-# button parks the new value here and it is applied at the top of the next run.
-if "_pending_vol" in st.session_state:
-    st.session_state["vol_pct"] = st.session_state.pop("_pending_vol")
+# Theme-matched accents for the few marks that are not part of a colour scale.
+NEUTRAL = "#94A3B8"
+ACCENT_RED = "#F87171"
 
 
-# ---------------------------------------------------------------- contract ---
+# Widget values cannot be written after their widget exists, so buttons park a
+# new value under a pending key and it is applied at the top of the next run.
+for pending_key, target_key in (("_pending_spot", "spot"), ("_pending_vol", "vol_pct")):
+    if pending_key in st.session_state:
+        st.session_state[target_key] = st.session_state.pop(pending_key)
+
+
+# ------------------------------------------------------------ cached data ---
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_spot(symbol: str) -> float:
+    return market_data.get_spot(symbol)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_history(symbol: str, period: str) -> pd.DataFrame:
+    return market_data.get_history(symbol, period)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_expiries(symbol: str) -> list[str]:
+    return market_data.get_expiries(symbol)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_chain(symbol: str, expiry: str) -> pd.DataFrame:
+    return market_data.get_option_chain(symbol, expiry)
+
+
+@st.cache_data(show_spinner=False)
+def cached_binomial_convergence(S, K, T, r, sigma, q, option_type, max_steps, exercise):
+    return binomial.convergence(S, K, T, r, sigma, q, option_type, max_steps, exercise)
+
+
+@st.cache_data(show_spinner=False)
+def cached_mc_convergence(S, K, T, r, sigma, q, option_type, n_paths, seed):
+    return monte_carlo.convergence(S, K, T, r, sigma, q, option_type, n_paths, seed)
+
+
+# ---------------------------------------------------------------- sidebar ---
 
 with st.sidebar:
-    st.header("Contract")
+    st.subheader("Contract")
 
     option_label = st.segmented_control(
-        "Option type",
-        options=["Call", "Put"],
-        default="Call",
-        key="option_label",
+        "Option type", options=["Call", "Put"], default="Call", key="option_label"
     )
     option_type = (option_label or "Call").lower()
 
-    spot = st.number_input("Spot price (S)", min_value=0.01, value=250.0, step=1.0)
+    exercise_label = st.segmented_control(
+        "Exercise style",
+        options=["European", "American"],
+        default="European",
+        key="exercise_label",
+        help=(
+            "European options can only be exercised at expiry. American options can be "
+            "exercised any time, which only the binomial tree here can price."
+        ),
+    )
+    exercise = (exercise_label or "European").lower()
+
+    st.session_state.setdefault("spot", 250.0)
+    spot = st.number_input("Spot price (S)", min_value=0.01, step=1.0, key="spot")
     strike = st.number_input("Strike price (K)", min_value=0.01, value=260.0, step=1.0)
-    days = st.number_input("Days to expiry", min_value=1, max_value=3650, value=30, step=1)
-    # Seeded once in session state rather than with `value=`, so the "use this
-    # IV" button on the implied-vol tab can write to it without Streamlit
-    # warning about a widget that has both a default and a stored value.
+
+    expiry_date = st.date_input(
+        "Expiry date",
+        value=date.today() + timedelta(days=30),
+        min_value=date.today() + timedelta(days=1),
+        max_value=date.today() + timedelta(days=3650),
+    )
+    days = max((expiry_date - date.today()).days, 1)
+
     st.session_state.setdefault("vol_pct", 28.4)
     vol_pct = st.number_input(
         "Volatility (annualised, %)",
@@ -59,25 +118,45 @@ with st.sidebar:
         max_value=500.0,
         step=0.5,
         key="vol_pct",
-        help="Used by the pricer, the scenario charts and the heatmap.",
+    )
+    st.caption("{} days to expiry.".format(days))
+
+    st.subheader("Market")
+    rate_pct = st.number_input(
+        "Risk-free rate (%)", min_value=-5.0, max_value=25.0, value=4.5, step=0.1
+    )
+    div_pct = st.number_input(
+        "Dividend yield (%)", min_value=0.0, max_value=25.0, value=0.0, step=0.1
     )
 
-    st.header("Market")
-    rate_pct = st.number_input("Risk-free rate (%)", min_value=-5.0, max_value=25.0, value=4.5, step=0.1)
-    div_pct = st.number_input("Dividend yield (%)", min_value=0.0, max_value=25.0, value=0.0, step=0.1)
+    st.subheader("Load from market")
+    ticker_symbol = (
+        st.text_input("Ticker", value="AAPL", max_chars=12, key="ticker").strip().upper()
+    )
+    if st.button("Fetch spot price", icon=":material/download:", width="stretch"):
+        try:
+            st.session_state["_pending_spot"] = round(cached_spot(ticker_symbol), 2)
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001 - any network/data failure
+            st.error("Could not fetch {}: {}".format(ticker_symbol, exc))
 
     st.caption(
-        "Time is measured in calendar days over a 365-day year. "
-        "Rates are continuously compounded."
+        "Time is measured in calendar days over a 365-day year. Rates are "
+        "continuously compounded."
     )
 
 T = days / DAYS_PER_YEAR
 r = rate_pct / 100.0
 q = div_pct / 100.0
 sigma = vol_pct / 100.0
+is_american = exercise == "american"
 
 
 # ----------------------------------------------------------------- helpers ---
+
+
+def money(x: float) -> str:
+    return "${:,.2f}".format(x)
 
 
 def greeks_frame(S, K, T, r, sigma, q) -> pd.DataFrame:
@@ -103,53 +182,334 @@ def spot_grid(S: float, width_pct: float, points: int = 121) -> np.ndarray:
 
 def reference_rules(S: float, K: float) -> alt.Chart:
     """Vertical markers for the current spot and the strike."""
-    marks = pd.DataFrame(
-        {"x": [S, K], "label": ["Spot", "Strike"], "dash": [[1, 0], [4, 4]]}
-    )
+    marks = pd.DataFrame({"x": [S, K], "label": ["Spot", "Strike"]})
     return (
         alt.Chart(marks)
-        .mark_rule(color="#8c8c8c", opacity=0.8)
+        .mark_rule(color=NEUTRAL, opacity=0.8)
         .encode(
             x=alt.X("x:Q"),
             strokeDash=alt.StrokeDash("label:N", title=None),
-            tooltip=["label:N", alt.Tooltip("x:Q", format=".2f", title="Level")],
+            tooltip=["label:N", alt.Tooltip("x:Q", format="$.2f", title="Level")],
         )
     )
 
 
-def money(x: float) -> str:
-    return "${:,.2f}".format(x)
+def horizontal_reference(value: float, label: str) -> alt.Chart:
+    """A dashed horizontal line, for marking a benchmark price on a chart."""
+    return (
+        alt.Chart(pd.DataFrame({"y": [value], "label": [label]}))
+        .mark_rule(color=NEUTRAL, strokeDash=[5, 4])
+        .encode(y="y:Q", tooltip=["label:N", alt.Tooltip("y:Q", format="$.4f")])
+    )
 
 
-# ------------------------------------------------------------------- header ---
+# ------------------------------------------------------------------ header ---
 
 st.title(":material/candlestick_chart: Options pricer")
 st.caption(
-    "Black-Scholes pricing, implied volatility from market quotes, "
-    "and scenario analysis across spot, volatility and time."
+    "Black-Scholes, binomial tree and Monte Carlo on one contract, with Greeks, "
+    "implied volatility and scenario analysis."
 )
 
-tab_price, tab_iv, tab_scenario, tab_smile = st.tabs(
-    ["Pricer", "Implied volatility", "Scenario analysis", "Volatility smile"]
+tab_pricing, tab_greeks, tab_iv, tab_smile, tab_underlying = st.tabs(
+    [
+        "Pricing models",
+        "Greeks & scenarios",
+        "Implied volatility",
+        "Volatility smile",
+        "Underlying",
+    ]
 )
 
 
-# ==================================================== 1. Black-Scholes pricer ==
+# ================================================== 1. Three pricing models ==
 
-with tab_price:
-    st.subheader("Black-Scholes pricer")
+with tab_pricing:
+    st.subheader("Three models, one contract")
+    st.caption(
+        "A closed form, a lattice and a simulation should all agree on the same "
+        "European option. Where they disagree is as informative as where they do not."
+    )
+
+    settings = st.container(horizontal=True, vertical_alignment="bottom")
+    with settings:
+        steps = st.select_slider(
+            "Binomial steps",
+            options=[10, 25, 50, 100, 250, 500, 1000, 2000],
+            value=500,
+            help="Time steps in the lattice. More steps converge towards Black-Scholes.",
+        )
+        n_paths = st.select_slider(
+            "Monte Carlo paths",
+            options=[1_000, 10_000, 50_000, 100_000, 500_000, 1_000_000],
+            value=100_000,
+            help="More paths shrink the standard error, but only as 1/sqrt(n).",
+        )
+        antithetic = st.toggle(
+            "Antithetic variates",
+            value=True,
+            help=(
+                "Pair every random draw Z with -Z. The payoffs are negatively "
+                "correlated, so averaging the pair cuts the variance for free."
+            ),
+        )
+        mc_seed = st.number_input("Random seed", min_value=0, value=7, step=1)
+
+    bs_call = bs_price(spot, strike, T, r, sigma, q, "call")
+    bs_put = bs_price(spot, strike, T, r, sigma, q, "put")
+    bs_selected = bs_call if option_type == "call" else bs_put
+
+    try:
+        tree_call = binomial.binomial_price(
+            spot, strike, T, r, sigma, q, "call", steps, exercise
+        )
+        tree_put = binomial.binomial_price(
+            spot, strike, T, r, sigma, q, "put", steps, exercise
+        )
+        tree_error = None
+    except ValueError as exc:
+        tree_call = tree_put = float("nan")
+        tree_error = str(exc)
+
+    mc_call = monte_carlo.monte_carlo_price(
+        spot, strike, T, r, sigma, q, "call", n_paths, antithetic, int(mc_seed)
+    )
+    mc_put = monte_carlo.monte_carlo_price(
+        spot, strike, T, r, sigma, q, "put", n_paths, antithetic, int(mc_seed)
+    )
+
+    tree_selected = tree_call if option_type == "call" else tree_put
+    mc_selected = mc_call if option_type == "call" else mc_put
+
+    col_bs, col_tree, col_mc = st.columns(3)
+
+    with col_bs:
+        with st.container(border=True):
+            st.markdown("**Black-Scholes**")
+            st.caption("Closed form - exact, instant, European only")
+            st.metric("Call", money(bs_call))
+            st.metric("Put", money(bs_put))
+            st.caption("Reference value for the other two.")
+
+    with col_tree:
+        with st.container(border=True):
+            st.markdown("**Binomial tree**")
+            st.caption("{:,} steps - Cox-Ross-Rubinstein lattice".format(steps))
+            if tree_error:
+                st.error(tree_error, icon=":material/error:")
+            else:
+                st.metric(
+                    "Call",
+                    money(tree_call),
+                    "{:+.4f} vs BS".format(tree_call - bs_call),
+                    delta_color="off",
+                )
+                st.metric(
+                    "Put",
+                    money(tree_put),
+                    "{:+.4f} vs BS".format(tree_put - bs_put),
+                    delta_color="off",
+                )
+                if is_american:
+                    st.caption("American exercise - the premium over BS is real, not error.")
+                else:
+                    st.caption("Difference is pure discretisation error.")
+
+    with col_mc:
+        with st.container(border=True):
+            st.markdown("**Monte Carlo**")
+            st.caption(
+                "{:,} paths{} - European only".format(
+                    mc_call.n_paths, ", antithetic" if antithetic else ""
+                )
+            )
+            st.metric(
+                "Call",
+                money(mc_call.price),
+                "+/- {:.4f} at 95%".format(1.96 * mc_call.std_error),
+                delta_color="off",
+            )
+            st.metric(
+                "Put",
+                money(mc_put.price),
+                "+/- {:.4f} at 95%".format(1.96 * mc_put.std_error),
+                delta_color="off",
+            )
+            inside = mc_call.ci_low <= bs_call <= mc_call.ci_high
+            st.caption(
+                ("Black-Scholes sits inside the 95% interval." if inside
+                 else "Black-Scholes falls outside the interval - unlucky draw or a bug.")
+            )
+
+    if is_american:
+        euro_tree = binomial.binomial_price(
+            spot, strike, T, r, sigma, q, option_type, steps, "european"
+        )
+        premium = tree_selected - euro_tree
+        st.info(
+            "Early-exercise premium on this {}: **{}**. Black-Scholes and the Monte Carlo "
+            "estimate above price the European contract, so only the binomial column is "
+            "pricing what you selected. An American call on a non-dividend payer is never "
+            "worth exercising early, so its premium is zero - the put's is not.".format(
+                option_type, money(premium)
+            ),
+            icon=":material/info:",
+        )
+
+    # --- convergence -------------------------------------------------------
+    left, right = st.columns(2)
+
+    with left:
+        with st.container(border=True):
+            st.markdown("**Binomial convergence**")
+            conv_steps, conv_prices = cached_binomial_convergence(
+                spot, strike, T, r, sigma, q, option_type, 150, exercise
+            )
+            conv = pd.DataFrame({"Steps": conv_steps, "Price": conv_prices})
+            line = (
+                alt.Chart(conv)
+                .mark_line(strokeWidth=1.5)
+                .encode(
+                    x=alt.X("Steps:Q", title="Time steps in the lattice"),
+                    y=alt.Y("Price:Q", scale=alt.Scale(zero=False), title="Option price ($)"),
+                    tooltip=[
+                        alt.Tooltip("Steps:Q"),
+                        alt.Tooltip("Price:Q", format="$.4f"),
+                    ],
+                )
+            )
+            st.altair_chart(
+                (line + horizontal_reference(bs_selected, "Black-Scholes")).properties(
+                    height=280
+                )
+            )
+            st.caption(
+                "The lattice price oscillates around Black-Scholes (dashed) and the swings "
+                "decay as steps are added. Odd and even step counts approach from opposite "
+                "sides, depending on whether a node lands on the strike."
+            )
+
+    with right:
+        with st.container(border=True):
+            st.markdown("**Monte Carlo convergence**")
+            counts, means, errors = cached_mc_convergence(
+                spot, strike, T, r, sigma, q, option_type, 50_000, int(mc_seed)
+            )
+            mc_conv = pd.DataFrame(
+                {
+                    "Paths": counts,
+                    "Estimate": means,
+                    "Low": means - 1.96 * errors,
+                    "High": means + 1.96 * errors,
+                }
+            )
+            band = (
+                alt.Chart(mc_conv)
+                .mark_area(opacity=0.22)
+                .encode(
+                    x=alt.X("Paths:Q", scale=alt.Scale(type="log"), title="Paths simulated"),
+                    y=alt.Y("Low:Q", scale=alt.Scale(zero=False), title="Option price ($)"),
+                    y2="High:Q",
+                )
+            )
+            estimate = (
+                alt.Chart(mc_conv)
+                .mark_line(strokeWidth=1.5)
+                .encode(
+                    x=alt.X("Paths:Q", scale=alt.Scale(type="log")),
+                    y=alt.Y("Estimate:Q", scale=alt.Scale(zero=False)),
+                    tooltip=[
+                        alt.Tooltip("Paths:Q", format=","),
+                        alt.Tooltip("Estimate:Q", format="$.4f"),
+                    ],
+                )
+            )
+            st.altair_chart(
+                (band + estimate + horizontal_reference(bs_selected, "Black-Scholes")).properties(
+                    height=280
+                )
+            )
+            st.caption(
+                "The shaded 95% interval narrows as 1/sqrt(n): every extra digit of "
+                "precision costs a hundred times the paths. This is why simulation is a "
+                "last resort when a closed form exists."
+            )
+
+    # --- simulated paths ---------------------------------------------------
+    with st.container(border=True):
+        st.markdown("**Simulated price paths**")
+        shown_paths = st.slider("Paths to draw", 10, 400, 120, step=10)
+
+        paths = monte_carlo.simulate_paths(
+            spot, T, r, sigma, q, n_paths=shown_paths, n_steps=min(days, 252),
+            seed=int(mc_seed),
+        )
+        step_days = np.linspace(0, days, paths.shape[0])
+        path_frame = pd.DataFrame(
+            {
+                "Day": np.tile(step_days, paths.shape[1]),
+                "Price": paths.T.ravel(),
+                "Path": np.repeat(np.arange(paths.shape[1]), paths.shape[0]),
+            }
+        )
+        finished_itm = float(
+            np.mean(
+                paths[-1] > strike if option_type == "call" else paths[-1] < strike
+            )
+        )
+
+        path_chart = (
+            alt.Chart(path_frame)
+            .mark_line(strokeWidth=0.7, opacity=0.5)
+            .encode(
+                x=alt.X("Day:Q", title="Days from today"),
+                y=alt.Y("Price:Q", scale=alt.Scale(zero=False), title="Underlying price ($)"),
+                detail="Path:N",
+            )
+        )
+        strike_rule = (
+            alt.Chart(pd.DataFrame({"y": [strike], "label": ["Strike"]}))
+            .mark_rule(color=ACCENT_RED, strokeDash=[6, 4], strokeWidth=1.5)
+            .encode(y="y:Q", tooltip=["label:N", alt.Tooltip("y:Q", format="$.2f")])
+        )
+        st.altair_chart((path_chart + strike_rule).properties(height=340))
+        st.caption(
+            "{:.0%} of these {} paths finished in the money. Each path is one draw from "
+            "the risk-neutral distribution; the option price is the discounted average of "
+            "their payoffs, not of their prices.".format(finished_itm, shown_paths)
+        )
+
+    with st.expander("How the three models relate"):
+        st.markdown(
+            "All three price the same expectation, `V = e^(-rT) E[payoff(S_T)]`, under "
+            "the risk-neutral measure. They differ only in how they evaluate it:"
+        )
+        st.markdown(
+            "- **Black-Scholes** solves the integral analytically, because under GBM "
+            "`S_T` is log-normal and the integral of a log-normal against a hockey-stick "
+            "payoff has a closed form.\n"
+            "- **The binomial tree** replaces the continuous process with a lattice and "
+            "evaluates the expectation by backward induction. Its error is discretisation "
+            "error, and it vanishes as steps increase.\n"
+            "- **Monte Carlo** samples the distribution directly. Its error is sampling "
+            "error, and it vanishes as `1/sqrt(n)` - never exactly, only in probability."
+        )
+        st.markdown(
+            "The tree earns its keep on American exercise, which has no closed form. "
+            "Monte Carlo earns its keep on path-dependent payoffs - Asian, barrier, "
+            "lookback - where the terminal price alone is not enough."
+        )
+
+
+# ============================================== 2. Greeks and scenario work ==
+
+with tab_greeks:
+    st.subheader("Greeks")
 
     g = scaled_greeks(spot, strike, T, r, sigma, q, option_type)
-    call_px = bs_price(spot, strike, T, r, sigma, q, "call")
-    put_px = bs_price(spot, strike, T, r, sigma, q, "put")
 
     with st.container(horizontal=True):
-        st.metric("Call price", money(call_px), border=True)
-        st.metric("Put price", money(put_px), border=True)
-        st.metric("Time to expiry", "{:.4f} yr".format(T), "{} days".format(days), delta_color="off", border=True)
-
-    st.markdown("**{} Greeks**".format(option_label))
-    with st.container(horizontal=True):
+        st.metric("{} price".format(option_label), money(g["price"]), border=True)
         st.metric("Delta", "{:.4f}".format(g["delta"]), border=True)
         st.metric("Gamma", "{:.4f}".format(g["gamma"]), border=True)
         st.metric("Vega", "{:.4f}".format(g["vega"]), border=True, help="Per 1 vol point")
@@ -169,12 +529,12 @@ with tab_price:
                     "Put": st.column_config.NumberColumn(format="%.4f"),
                 },
             )
+            st.caption("Gamma and vega are identical for a call and a put on one contract.")
 
     with right:
         with st.container(border=True):
             st.markdown("**Intermediate quantities**")
             d1, d2 = d1_d2(spot, strike, T, r, sigma, q)
-            forward = spot * np.exp((r - q) * T)
             st.dataframe(
                 pd.DataFrame(
                     {
@@ -183,7 +543,7 @@ with tab_price:
                             float(d1),
                             float(d2),
                             float(norm.cdf(d2)),
-                            float(forward),
+                            float(spot * np.exp((r - q) * T)),
                             float(spot / strike),
                         ],
                     }
@@ -191,29 +551,243 @@ with tab_price:
                 hide_index=True,
                 column_config={"Value": st.column_config.NumberColumn(format="%.4f")},
             )
+            st.caption("N(d2) is the risk-neutral probability a call finishes in the money.")
+
+    st.subheader("Scenario analysis")
+
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
+        spot_range = st.slider("Spot range (+/- %)", 5, 60, 20, step=5)
+        vol_range = st.slider("Vol range (+/- pts)", 2, 30, 10, step=1)
+        grid_steps = st.select_slider("Heatmap size", options=[3, 5, 7, 9], value=5)
+
+    grid = spot_grid(spot, spot_range)
+
+    price_now = bs_price(grid, strike, T, r, sigma, q, option_type)
+    intrinsic = (
+        np.maximum(grid - strike, 0.0)
+        if option_type == "call"
+        else np.maximum(strike - grid, 0.0)
+    )
+    half_life = bs_price(grid, strike, T / 2.0, r, sigma, q, option_type)
+
+    profile = pd.DataFrame(
+        {
+            "Underlying price": np.tile(grid, 3),
+            "Option price": np.concatenate([price_now, half_life, intrinsic]),
+            "Series": np.repeat(
+                [
+                    "Today ({}d)".format(days),
+                    "Halfway ({}d)".format(max(days // 2, 1)),
+                    "At expiry",
+                ],
+                len(grid),
+            ),
+        }
+    )
+
+    chart_left, chart_right = st.columns(2)
+
+    with chart_left:
+        with st.container(border=True):
+            st.markdown("**Option price vs underlying**")
+            profile_chart = (
+                alt.Chart(profile)
+                .mark_line(strokeWidth=2)
+                .encode(
+                    x=alt.X(
+                        "Underlying price:Q",
+                        scale=alt.Scale(zero=False),
+                        title="Underlying price ($)",
+                    ),
+                    y=alt.Y("Option price:Q", title="Option price ($)"),
+                    color=alt.Color("Series:N", title=None, legend=alt.Legend(orient="top")),
+                    tooltip=[
+                        alt.Tooltip("Underlying price:Q", format="$.2f"),
+                        alt.Tooltip("Option price:Q", format="$.2f"),
+                        "Series:N",
+                    ],
+                )
+            )
+            st.altair_chart(
+                (profile_chart + reference_rules(spot, strike)).properties(height=320)
+            )
             st.caption(
-                "N(d2) is the risk-neutral probability the call finishes in the money."
+                "The gap between today's curve and the intrinsic line is time value - the "
+                "part of the premium that decays away."
             )
 
-    with st.expander("The formula"):
-        st.latex(r"d_1 = \frac{\ln(S/K) + (r - q + \tfrac{1}{2}\sigma^2)T}{\sigma\sqrt{T}}, \qquad d_2 = d_1 - \sigma\sqrt{T}")
+    with chart_right:
+        with st.container(border=True):
+            st.markdown("**Delta and gamma vs underlying**")
+            grid_greeks = scaled_greeks(grid, strike, T, r, sigma, q, option_type)
+            risk = pd.DataFrame(
+                {
+                    "Underlying price": grid,
+                    "Delta": grid_greeks["delta"],
+                    "Gamma": grid_greeks["gamma"],
+                }
+            )
+            delta_line = (
+                alt.Chart(risk)
+                .mark_line(strokeWidth=2)
+                .encode(
+                    x=alt.X(
+                        "Underlying price:Q",
+                        scale=alt.Scale(zero=False),
+                        title="Underlying price ($)",
+                    ),
+                    y=alt.Y("Delta:Q", title="Delta"),
+                    color=alt.datum("Delta"),
+                    tooltip=[
+                        alt.Tooltip("Underlying price:Q", format="$.2f"),
+                        alt.Tooltip("Delta:Q", format=".3f"),
+                    ],
+                )
+            )
+            gamma_line = (
+                alt.Chart(risk)
+                .mark_line(strokeWidth=2, strokeDash=[5, 3])
+                .encode(
+                    x=alt.X("Underlying price:Q", scale=alt.Scale(zero=False)),
+                    y=alt.Y("Gamma:Q", title="Gamma"),
+                    color=alt.datum("Gamma"),
+                    tooltip=[
+                        alt.Tooltip("Underlying price:Q", format="$.2f"),
+                        alt.Tooltip("Gamma:Q", format=".4f"),
+                    ],
+                )
+            )
+            st.altair_chart(
+                alt.layer(delta_line, gamma_line)
+                .resolve_scale(y="independent")
+                .properties(height=320)
+                .configure_legend(orient="top", title=None)
+            )
+            st.caption(
+                "Delta on the left axis, gamma (dashed) on the right. Gamma peaks near the "
+                "strike, which is where delta is changing fastest."
+            )
+
+    with st.container(border=True):
+        st.markdown("**Spot x volatility heatmap**")
+
+        spot_axis = np.linspace(
+            spot * (1 - spot_range / 100.0), spot * (1 + spot_range / 100.0), grid_steps
+        )
+        vol_axis = np.linspace(max(vol_pct - vol_range, 1.0), vol_pct + vol_range, grid_steps)
+
+        mesh_spot, mesh_vol = np.meshgrid(spot_axis, vol_axis, indexing="ij")
+        mesh_price = bs_price(mesh_spot, strike, T, r, mesh_vol / 100.0, q, option_type)
+
+        heat = pd.DataFrame(
+            {
+                "Spot": mesh_spot.ravel(),
+                "Vol": mesh_vol.ravel(),
+                "Price": mesh_price.ravel(),
+            }
+        )
+        heat["Spot label"] = heat["Spot"].map("{:,.0f}".format)
+        heat["Vol label"] = heat["Vol"].map("{:.0f}%".format)
+
+        spot_order = ["{:,.0f}".format(v) for v in sorted(spot_axis, reverse=True)]
+        vol_order = ["{:.0f}%".format(v) for v in vol_axis]
+
+        base = alt.Chart(heat).encode(
+            x=alt.X(
+                "Vol label:O",
+                sort=vol_order,
+                title="Implied volatility",
+                axis=alt.Axis(labelAngle=0),
+            ),
+            y=alt.Y("Spot label:O", sort=spot_order, title="Spot price"),
+        )
+        cells = base.mark_rect().encode(
+            color=alt.Color(
+                "Price:Q",
+                scale=alt.Scale(scheme="darkblue"),
+                legend=alt.Legend(title="Price ($)", format="$.2f"),
+            ),
+            tooltip=[
+                alt.Tooltip("Spot:Q", format="$.2f"),
+                alt.Tooltip("Vol:Q", format=".1f", title="Vol (%)"),
+                alt.Tooltip("Price:Q", format="$.2f"),
+            ],
+        )
+        # The colour scheme runs dark (cheap) to light (expensive), so the label
+        # has to flip the other way to stay readable on both ends.
+        midpoint = float(heat["Price"].max() + heat["Price"].min()) / 2.0
+        labels = base.mark_text(fontSize=13, fontWeight="bold").encode(
+            text=alt.Text("Price:Q", format=".2f"),
+            color=alt.condition(
+                alt.datum.Price > midpoint, alt.value("#0F172A"), alt.value("#E2E8F0")
+            ),
+        )
+        st.altair_chart((cells + labels).properties(height=60 + 46 * grid_steps))
+        st.caption(
+            "Each cell reprices the same {} at a different spot and volatility, holding "
+            "{} days to expiry fixed. Reading across a row isolates vega; reading down a "
+            "column isolates delta and gamma.".format(option_type, days)
+        )
+
+    with st.container(border=True):
+        st.markdown("**Time decay**")
+        day_axis = np.arange(days, 0, -1)
+        decay = pd.DataFrame(
+            {
+                "Days to expiry": day_axis,
+                "Option price": bs_price(
+                    spot, strike, day_axis / DAYS_PER_YEAR, r, sigma, q, option_type
+                ),
+            }
+        )
+        decay_chart = (
+            alt.Chart(decay)
+            .mark_line(strokeWidth=2)
+            .encode(
+                x=alt.X(
+                    "Days to expiry:Q",
+                    scale=alt.Scale(reverse=True),
+                    title="Days to expiry",
+                ),
+                y=alt.Y("Option price:Q", title="Option price ($)"),
+                tooltip=[
+                    alt.Tooltip("Days to expiry:Q"),
+                    alt.Tooltip("Option price:Q", format="$.2f"),
+                ],
+            )
+        )
+        st.altair_chart(decay_chart.properties(height=260))
+        st.caption(
+            "Holding spot and volatility fixed, time value bleeds away - slowly at first, "
+            "then sharply into the last few weeks."
+        )
+
+    with st.expander("The Black-Scholes formula"):
+        st.latex(
+            r"d_1 = \frac{\ln(S/K) + (r - q + \tfrac{1}{2}\sigma^2)T}{\sigma\sqrt{T}},"
+            r"\qquad d_2 = d_1 - \sigma\sqrt{T}"
+        )
         st.latex(r"C = S e^{-qT} N(d_1) - K e^{-rT} N(d_2)")
         st.latex(r"P = K e^{-rT} N(-d_2) - S e^{-qT} N(-d_1)")
-        st.markdown(
-            "Put-call parity ties the two together: "
-            r"$C - P = S e^{-qT} - K e^{-rT}$."
+        parity = (
+            bs_price(spot, strike, T, r, sigma, q, "call")
+            - bs_price(spot, strike, T, r, sigma, q, "put")
+            - (spot * np.exp(-q * T) - strike * np.exp(-r * T))
         )
-        parity = call_px - put_px - (spot * np.exp(-q * T) - strike * np.exp(-r * T))
+        st.markdown(
+            r"Put-call parity ties them together: $C - P = S e^{-qT} - K e^{-rT}$."
+        )
         st.caption("Parity residual for these inputs: {:.2e}".format(parity))
 
 
-# =============================================== 2. Implied volatility solver ==
+# =============================================== 3. Implied volatility solver ==
 
 with tab_iv:
     st.subheader("Implied volatility")
     st.caption(
-        "Black-Scholes turns a volatility into a price. Here we run it backwards: "
-        "given the price the market is showing, what volatility does it imply?"
+        "Black-Scholes turns a volatility into a price. Here we run it backwards: given "
+        "the price the market is showing, what volatility does it imply?"
     )
 
     lower, upper = price_bounds(spot, strike, T, r, q, option_type)
@@ -258,6 +832,7 @@ with tab_iv:
                         delta_color="off",
                     )
                 with action:
+
                     def _apply_iv(value: float = iv * 100.0) -> None:
                         st.session_state["_pending_vol"] = round(value, 2)
 
@@ -269,8 +844,7 @@ with tab_iv:
                     )
 
                 st.caption(
-                    "Solved by {} in {} iteration{} - repriced at {}, "
-                    "{} off the quote.".format(
+                    "Solved by {} in {} iteration{} - repriced at {}, {} off the quote.".format(
                         result.method,
                         result.iterations,
                         "" if result.iterations == 1 else "s",
@@ -307,8 +881,8 @@ with tab_iv:
         st.markdown("**Why the price is monotone in volatility**")
         st.caption(
             "Vega is positive everywhere, so the option price rises strictly with "
-            "volatility. That guarantees exactly one solution, and lets bisection work "
-            "as a fallback whenever Newton's vega-based step breaks down."
+            "volatility. That guarantees exactly one solution, and lets bisection work as "
+            "a fallback whenever Newton's vega-based step breaks down."
         )
         vol_ceiling = min(3.0, max(1.2, sigma * 3.0 + 0.6))
         monotone_axis = np.linspace(0.01, vol_ceiling, 160)
@@ -331,196 +905,11 @@ with tab_iv:
             )
         )
         quote = (
-            alt.Chart(pd.DataFrame({"y": [market_price]}))
-            .mark_rule(color="#d62728", strokeDash=[5, 4])
-            .encode(y="y:Q")
+            alt.Chart(pd.DataFrame({"y": [market_price], "label": ["Market quote"]}))
+            .mark_rule(color=ACCENT_RED, strokeDash=[5, 4])
+            .encode(y="y:Q", tooltip=["label:N", alt.Tooltip("y:Q", format="$.2f")])
         )
         st.altair_chart((line + quote).properties(height=260))
-
-
-# =================================================== 3. Scenario visualiser ===
-
-with tab_scenario:
-    st.subheader("Scenario analysis")
-
-    settings = st.container(horizontal=True, vertical_alignment="bottom")
-    with settings:
-        spot_range = st.slider("Spot range (+/- %)", 5, 60, 20, step=5)
-        vol_range = st.slider("Vol range (+/- pts)", 2, 30, 10, step=1)
-        grid_steps = st.select_slider("Heatmap size", options=[3, 5, 7, 9], value=5)
-
-    grid = spot_grid(spot, spot_range)
-
-    # --- payoff / price profile -------------------------------------------
-    price_now = bs_price(grid, strike, T, r, sigma, q, option_type)
-    if option_type == "call":
-        intrinsic = np.maximum(grid - strike, 0.0)
-    else:
-        intrinsic = np.maximum(strike - grid, 0.0)
-    half_life = bs_price(grid, strike, T / 2.0, r, sigma, q, option_type)
-
-    profile = pd.DataFrame(
-        {
-            "Underlying price": np.tile(grid, 3),
-            "Option price": np.concatenate([price_now, half_life, intrinsic]),
-            "Series": np.repeat(
-                [
-                    "Today ({} days)".format(days),
-                    "Halfway ({} days)".format(max(days // 2, 1)),
-                    "At expiry (intrinsic)",
-                ],
-                len(grid),
-            ),
-        }
-    )
-
-    left, right = st.columns(2)
-
-    with left:
-        with st.container(border=True):
-            st.markdown("**Option price vs underlying**")
-            profile_chart = (
-                alt.Chart(profile)
-                .mark_line(strokeWidth=2)
-                .encode(
-                    x=alt.X("Underlying price:Q", scale=alt.Scale(zero=False), title="Underlying price ($)"),
-                    y=alt.Y("Option price:Q", title="Option price ($)"),
-                    color=alt.Color("Series:N", title=None, legend=alt.Legend(orient="top")),
-                    tooltip=[
-                        alt.Tooltip("Underlying price:Q", format="$.2f"),
-                        alt.Tooltip("Option price:Q", format="$.2f"),
-                        "Series:N",
-                    ],
-                )
-            )
-            st.altair_chart((profile_chart + reference_rules(spot, strike)).properties(height=320))
-            st.caption(
-                "The gap between today's curve and the intrinsic line is time value - "
-                "the part of the premium that decays away."
-            )
-
-    with right:
-        with st.container(border=True):
-            st.markdown("**Delta and gamma vs underlying**")
-            grid_greeks = scaled_greeks(grid, strike, T, r, sigma, q, option_type)
-            risk = pd.DataFrame(
-                {
-                    "Underlying price": grid,
-                    "Delta": grid_greeks["delta"],
-                    "Gamma": grid_greeks["gamma"],
-                }
-            )
-            delta_line = (
-                alt.Chart(risk)
-                .mark_line(strokeWidth=2, color="#1f77b4")
-                .encode(
-                    x=alt.X("Underlying price:Q", scale=alt.Scale(zero=False), title="Underlying price ($)"),
-                    y=alt.Y("Delta:Q", title="Delta", axis=alt.Axis(titleColor="#1f77b4")),
-                    tooltip=[alt.Tooltip("Underlying price:Q", format="$.2f"), alt.Tooltip("Delta:Q", format=".3f")],
-                )
-            )
-            gamma_line = (
-                alt.Chart(risk)
-                .mark_line(strokeWidth=2, color="#ff7f0e", strokeDash=[5, 3])
-                .encode(
-                    x=alt.X("Underlying price:Q", scale=alt.Scale(zero=False)),
-                    y=alt.Y("Gamma:Q", title="Gamma", axis=alt.Axis(titleColor="#ff7f0e")),
-                    tooltip=[alt.Tooltip("Underlying price:Q", format="$.2f"), alt.Tooltip("Gamma:Q", format=".4f")],
-                )
-            )
-            st.altair_chart(
-                alt.layer(delta_line, gamma_line).resolve_scale(y="independent").properties(height=320)
-            )
-            st.caption(
-                "Blue: delta (left axis). Orange dashed: gamma (right axis). Gamma peaks "
-                "near the strike, which is where delta is changing fastest."
-            )
-
-    # --- spot x vol heatmap ------------------------------------------------
-    with st.container(border=True):
-        st.markdown("**Spot x volatility heatmap**")
-
-        spot_axis = np.linspace(spot * (1 - spot_range / 100.0), spot * (1 + spot_range / 100.0), grid_steps)
-        vol_axis = np.linspace(max(vol_pct - vol_range, 1.0), vol_pct + vol_range, grid_steps)
-
-        mesh_spot, mesh_vol = np.meshgrid(spot_axis, vol_axis, indexing="ij")
-        mesh_price = bs_price(mesh_spot, strike, T, r, mesh_vol / 100.0, q, option_type)
-
-        heat = pd.DataFrame(
-            {
-                "Spot": mesh_spot.ravel(),
-                "Vol": mesh_vol.ravel(),
-                "Price": mesh_price.ravel(),
-            }
-        )
-        heat["Spot label"] = heat["Spot"].map("{:,.0f}".format)
-        heat["Vol label"] = heat["Vol"].map("{:.0f}%".format)
-
-        spot_order = [f"{v:,.0f}" for v in sorted(spot_axis, reverse=True)]
-        vol_order = [f"{v:.0f}%" for v in vol_axis]
-
-        base = alt.Chart(heat).encode(
-            x=alt.X(
-                "Vol label:O",
-                sort=vol_order,
-                title="Implied volatility",
-                axis=alt.Axis(labelAngle=0),
-            ),
-            y=alt.Y("Spot label:O", sort=spot_order, title="Spot price"),
-        )
-        cells = base.mark_rect().encode(
-            color=alt.Color(
-                "Price:Q",
-                scale=alt.Scale(scheme="blues"),
-                legend=alt.Legend(title="Option price ($)", format="$.2f"),
-            ),
-            tooltip=[
-                alt.Tooltip("Spot:Q", format="$.2f"),
-                alt.Tooltip("Vol:Q", format=".1f", title="Vol (%)"),
-                alt.Tooltip("Price:Q", format="$.2f"),
-            ],
-        )
-        midpoint = float(heat["Price"].max() + heat["Price"].min()) / 2.0
-        labels = base.mark_text(fontSize=13, fontWeight="bold").encode(
-            text=alt.Text("Price:Q", format=".2f"),
-            color=alt.condition(
-                alt.datum.Price > midpoint, alt.value("white"), alt.value("#1a1a1a")
-            ),
-        )
-        st.altair_chart((cells + labels).properties(height=60 + 46 * grid_steps))
-        st.caption(
-            "Each cell reprices the same {} at a different spot and volatility, holding "
-            "{} days to expiry fixed. Reading across a row isolates vega; reading down a "
-            "column isolates delta and gamma.".format(option_type, days)
-        )
-
-    # --- time decay --------------------------------------------------------
-    with st.container(border=True):
-        st.markdown("**Time decay**")
-        day_axis = np.arange(days, 0, -1)
-        decay = pd.DataFrame(
-            {
-                "Days to expiry": day_axis,
-                "Option price": bs_price(spot, strike, day_axis / DAYS_PER_YEAR, r, sigma, q, option_type),
-            }
-        )
-        decay_chart = (
-            alt.Chart(decay)
-            .mark_line(strokeWidth=2, color="#2ca02c")
-            .encode(
-                x=alt.X("Days to expiry:Q", scale=alt.Scale(reverse=True), title="Days to expiry"),
-                y=alt.Y("Option price:Q", title="Option price ($)"),
-                tooltip=[
-                    alt.Tooltip("Days to expiry:Q"),
-                    alt.Tooltip("Option price:Q", format="$.2f"),
-                ],
-            )
-        )
-        st.altair_chart(decay_chart.properties(height=260))
-        st.caption(
-            "Holding spot and volatility fixed, time value bleeds away - slowly at first, "
-            "then sharply into the last few weeks."
-        )
 
 
 # ================================================== 4. Volatility smile (V2) ==
@@ -528,74 +917,33 @@ with tab_scenario:
 with tab_smile:
     st.subheader("Volatility smile")
     st.caption(
-        "Black-Scholes assumes one volatility for every strike. Real option chains "
-        "do not agree: solve for implied vol strike by strike and the result curves."
+        "Black-Scholes assumes one volatility for every strike. Real option chains do not "
+        "agree: solve for implied vol strike by strike and the result curves."
     )
-
-    @st.cache_data(ttl=900, show_spinner=False)
-    def load_expiries(symbol: str) -> list[str]:
-        import yfinance as yf
-
-        return list(yf.Ticker(symbol).options)
-
-    @st.cache_data(ttl=900, show_spinner=False)
-    def load_spot_price(symbol: str) -> float:
-        import yfinance as yf
-
-        info = yf.Ticker(symbol).fast_info
-        for key in ("last_price", "lastPrice", "previous_close"):
-            try:
-                value = info[key]
-            except (KeyError, TypeError):
-                continue
-            if value:
-                return float(value)
-        history = yf.Ticker(symbol).history(period="5d")
-        return float(history["Close"].iloc[-1])
-
-    @st.cache_data(ttl=900, show_spinner=False)
-    def load_chain(symbol: str, expiry: str) -> pd.DataFrame:
-        import yfinance as yf
-
-        chain = yf.Ticker(symbol).option_chain(expiry)
-        columns = [
-            "strike",
-            "bid",
-            "ask",
-            "lastPrice",
-            "lastTradeDate",
-            "volume",
-            "openInterest",
-            "impliedVolatility",
-        ]
-        frames = []
-        for kind, table in (("call", chain.calls), ("put", chain.puts)):
-            part = table[columns].copy()
-            part["type"] = kind
-            frames.append(part)
-        return pd.concat(frames, ignore_index=True)
 
     controls = st.container(horizontal=True, vertical_alignment="bottom")
     with controls:
-        symbol = st.text_input("Ticker", value="AAPL", max_chars=12, width=200).strip().upper()
-        fetch = st.button("Load option chain", icon=":material/download:", type="primary")
+        st.caption("Using ticker **{}** from the sidebar.".format(ticker_symbol or "-"))
+        fetch = st.button(
+            "Load option chain", icon=":material/download:", type="primary"
+        )
 
     if fetch:
-        st.session_state["smile_symbol"] = symbol
+        st.session_state["smile_symbol"] = ticker_symbol
 
     active_symbol = st.session_state.get("smile_symbol")
 
     if not active_symbol:
         st.info(
-            "Enter a ticker and load its option chain to see the smile. "
-            "Requires an internet connection (data via Yahoo Finance).",
+            "Load the option chain for the sidebar ticker to see the smile. Requires an "
+            "internet connection (data via Yahoo Finance).",
             icon=":material/info:",
         )
     else:
         try:
             with st.spinner("Fetching {} option chain...".format(active_symbol)):
-                expiries = load_expiries(active_symbol)
-                live_spot = load_spot_price(active_symbol)
+                expiries = cached_expiries(active_symbol)
+                live_spot = cached_spot(active_symbol)
         except Exception as exc:  # noqa: BLE001 - surface any network/data failure
             expiries, live_spot = [], None
             st.error(
@@ -625,33 +973,17 @@ with tab_smile:
                     ),
                 )
 
-            expiry_date = pd.Timestamp(expiry)
-            days_left = max((expiry_date - pd.Timestamp.now().normalize()).days, 1)
+            days_left = max((pd.Timestamp(expiry) - pd.Timestamp.now().normalize()).days, 1)
             T_live = days_left / DAYS_PER_YEAR
 
             try:
-                chain = load_chain(active_symbol, expiry)
+                chain = cached_chain(active_symbol, expiry)
             except Exception as exc:  # noqa: BLE001
                 chain = pd.DataFrame()
                 st.error("Could not load the chain: {}".format(exc), icon=":material/error:")
 
             if not chain.empty:
-                chain = chain.copy()
-                # A two-sided quote is the better input, but the free Yahoo feed
-                # often returns no bid/ask outside market hours. Fall back to the
-                # last traded price and label which one was used, because a stale
-                # print produces a stale implied vol.
-                quoted = (chain["bid"] > 0) & (chain["ask"] > chain["bid"])
-                chain["mid"] = np.where(
-                    quoted, (chain["bid"] + chain["ask"]) / 2.0, chain["lastPrice"]
-                )
-                chain["source"] = np.where(quoted, "bid/ask mid", "last traded")
-
-                # Yahoo leaves volume and open interest blank on untraded strikes.
-                chain["volume"] = chain["volume"].fillna(0)
-                chain["openInterest"] = chain["openInterest"].fillna(0)
-
-                chain = chain[chain["mid"] > 0]
+                chain = chain[chain["price"] > 0]
                 chain = chain[chain["volume"] >= min_volume]
                 chain = chain[
                     chain["strike"].between(
@@ -659,7 +991,6 @@ with tab_smile:
                         live_spot * (1 + moneyness_band / 100.0),
                     )
                 ]
-
                 if otm_only:
                     chain = chain[
                         ((chain["type"] == "call") & (chain["strike"] >= live_spot))
@@ -670,18 +1001,20 @@ with tab_smile:
                 for row in chain.itertuples(index=False):
                     try:
                         res = implied_vol(
-                            row.mid, live_spot, row.strike, T_live, r, q, row.type
+                            row.price, live_spot, row.strike, T_live, r, q, row.type
                         )
                     except ImpliedVolError:
                         continue
-                    contract_vega = vega(live_spot, row.strike, T_live, r, res.sigma, q) / 100.0
+                    contract_vega = (
+                        vega(live_spot, row.strike, T_live, r, res.sigma, q) / 100.0
+                    )
                     if contract_vega < VEGA_RELIABILITY_FLOOR:
                         continue  # price carries no volatility information
                     solved.append(
                         {
                             "Strike": float(row.strike),
                             "Type": row.type,
-                            "Price": float(row.mid),
+                            "Price": float(row.price),
                             "Source": row.source,
                             "Implied vol (%)": res.sigma * 100.0,
                             "Yahoo IV (%)": float(row.impliedVolatility) * 100.0,
@@ -705,22 +1038,30 @@ with tab_smile:
                     with st.container(horizontal=True):
                         st.metric("Spot", money(live_spot), border=True)
                         st.metric("Days to expiry", str(days_left), border=True)
-                        st.metric("ATM implied vol", "{:.1f}%".format(atm["Implied vol (%)"]), border=True)
+                        st.metric(
+                            "ATM implied vol",
+                            "{:.1f}%".format(atm["Implied vol (%)"]),
+                            border=True,
+                        )
                         st.metric("Strikes solved", str(len(smile)), border=True)
 
                     with st.container(border=True):
                         st.markdown("**Implied volatility by strike**")
                         points = (
                             alt.Chart(smile)
-                            .mark_circle(size=70, opacity=0.8)
+                            .mark_circle(size=70, opacity=0.85)
                             .encode(
-                                x=alt.X("Strike:Q", scale=alt.Scale(zero=False), title="Strike ($)"),
+                                x=alt.X(
+                                    "Strike:Q", scale=alt.Scale(zero=False), title="Strike ($)"
+                                ),
                                 y=alt.Y(
                                     "Implied vol (%):Q",
                                     scale=alt.Scale(zero=False),
                                     title="Implied volatility (%)",
                                 ),
-                                color=alt.Color("Type:N", title=None, legend=alt.Legend(orient="top")),
+                                color=alt.Color(
+                                    "Type:N", title=None, legend=alt.Legend(orient="top")
+                                ),
                                 tooltip=[
                                     alt.Tooltip("Strike:Q", format="$.2f"),
                                     "Type:N",
@@ -734,7 +1075,9 @@ with tab_smile:
                         )
                         trend = (
                             alt.Chart(smile)
-                            .transform_loess("Strike", "Implied vol (%)", groupby=["Type"], bandwidth=0.45)
+                            .transform_loess(
+                                "Strike", "Implied vol (%)", groupby=["Type"], bandwidth=0.45
+                            )
                             .mark_line(strokeWidth=2)
                             .encode(
                                 x=alt.X("Strike:Q", scale=alt.Scale(zero=False)),
@@ -743,9 +1086,12 @@ with tab_smile:
                             )
                         )
                         spot_rule = (
-                            alt.Chart(pd.DataFrame({"x": [live_spot]}))
-                            .mark_rule(color="#8c8c8c", strokeDash=[4, 4])
-                            .encode(x="x:Q", tooltip=alt.Tooltip("x:Q", format="$.2f", title="Spot"))
+                            alt.Chart(pd.DataFrame({"x": [live_spot], "label": ["Spot"]}))
+                            .mark_rule(color=NEUTRAL, strokeDash=[4, 4])
+                            .encode(
+                                x="x:Q",
+                                tooltip=["label:N", alt.Tooltip("x:Q", format="$.2f")],
+                            )
                         )
                         st.altair_chart((points + trend + spot_rule).properties(height=380))
                         st.caption(
@@ -779,3 +1125,152 @@ with tab_smile:
                             "American-exercise assumptions. Rows priced off a last trade "
                             "rather than a live bid/ask inherit that print's staleness."
                         )
+
+
+# ============================================= 5. Underlying and realised vol ==
+
+with tab_underlying:
+    st.subheader("Underlying")
+    st.caption(
+        "The volatility an option is quoting is a forecast. This is what the underlying "
+        "has actually done."
+    )
+
+    controls = st.container(horizontal=True, vertical_alignment="bottom")
+    with controls:
+        st.caption("Using ticker **{}** from the sidebar.".format(ticker_symbol or "-"))
+        period = st.segmented_control(
+            "History window",
+            options=["3mo", "6mo", "1y", "2y", "5y"],
+            default="1y",
+            key="history_period",
+        )
+        load_history = st.button("Load history", icon=":material/show_chart:", type="primary")
+
+    if load_history:
+        st.session_state["history_symbol"] = ticker_symbol
+
+    history_symbol = st.session_state.get("history_symbol")
+
+    if not history_symbol:
+        st.info(
+            "Load price history for the sidebar ticker to compare realised volatility "
+            "against the volatility you are pricing with.",
+            icon=":material/info:",
+        )
+    else:
+        try:
+            with st.spinner("Fetching {} history...".format(history_symbol)):
+                history = cached_history(history_symbol, period or "1y")
+        except Exception as exc:  # noqa: BLE001
+            history = pd.DataFrame()
+            st.error(
+                "Could not load history for {}: {}".format(history_symbol, exc),
+                icon=":material/error:",
+            )
+
+        if not history.empty:
+            closes = history["Close"]
+            realised_full = market_data.realised_volatility(closes)
+            realised_30 = market_data.realised_volatility(closes, window=30)
+            total_return = float(closes.iloc[-1] / closes.iloc[0] - 1.0)
+
+            with st.container(horizontal=True):
+                st.metric("Last close", money(float(closes.iloc[-1])), border=True)
+                st.metric(
+                    "Return over window",
+                    "{:+.1%}".format(total_return),
+                    border=True,
+                )
+                st.metric(
+                    "Realised vol (window)",
+                    "{:.1f}%".format(realised_full * 100.0),
+                    border=True,
+                )
+                st.metric(
+                    "Realised vol (30d)",
+                    "{:.1f}%".format(realised_30 * 100.0),
+                    "{:+.1f} pts vs pricing vol".format(realised_30 * 100.0 - vol_pct),
+                    delta_color="off",
+                    border=True,
+                )
+
+            def _apply_realised(value: float = realised_30 * 100.0) -> None:
+                st.session_state["_pending_vol"] = round(value, 2)
+
+            def _apply_last_close(value: float = float(closes.iloc[-1])) -> None:
+                st.session_state["_pending_spot"] = round(value, 2)
+
+            actions = st.container(horizontal=True)
+            with actions:
+                st.button(
+                    "Price with 30-day realised vol",
+                    icon=":material/sync:",
+                    on_click=_apply_realised,
+                )
+                st.button(
+                    "Use last close as spot",
+                    icon=":material/sync:",
+                    on_click=_apply_last_close,
+                )
+
+            price_history = pd.DataFrame(
+                {"Date": closes.index, "Close": closes.to_numpy(dtype=float)}
+            )
+
+            chart_left, chart_right = st.columns([3, 2])
+
+            with chart_left:
+                with st.container(border=True):
+                    st.markdown("**Price history**")
+                    price_line = (
+                        alt.Chart(price_history)
+                        .mark_line(strokeWidth=1.8)
+                        .encode(
+                            x=alt.X("Date:T", title=None),
+                            y=alt.Y(
+                                "Close:Q", scale=alt.Scale(zero=False), title="Close ($)"
+                            ),
+                            tooltip=[
+                                alt.Tooltip("Date:T"),
+                                alt.Tooltip("Close:Q", format="$.2f"),
+                            ],
+                        )
+                    )
+                    strike_line = (
+                        alt.Chart(pd.DataFrame({"y": [strike], "label": ["Strike"]}))
+                        .mark_rule(color=ACCENT_RED, strokeDash=[6, 4])
+                        .encode(
+                            y="y:Q", tooltip=["label:N", alt.Tooltip("y:Q", format="$.2f")]
+                        )
+                    )
+                    st.altair_chart((price_line + strike_line).properties(height=320))
+                    st.caption(
+                        "Red dashed line is the strike from the sidebar, for context on how "
+                        "far out of the money the contract sits."
+                    )
+
+            with chart_right:
+                with st.container(border=True):
+                    st.markdown("**Distribution of daily returns**")
+                    log_returns = np.log(closes / closes.shift(1)).dropna() * 100.0
+                    returns_frame = pd.DataFrame({"Daily log return (%)": log_returns.to_numpy()})
+                    histogram = (
+                        alt.Chart(returns_frame)
+                        .mark_bar(opacity=0.85)
+                        .encode(
+                            x=alt.X(
+                                "Daily log return (%):Q",
+                                bin=alt.Bin(maxbins=40),
+                                title="Daily log return (%)",
+                            ),
+                            y=alt.Y("count()", title="Days"),
+                            tooltip=[alt.Tooltip("count()", title="Days")],
+                        )
+                    )
+                    st.altair_chart(histogram.properties(height=320))
+                    st.caption(
+                        "Black-Scholes assumes these are normally distributed. Real returns "
+                        "have fatter tails than a normal, which is part of why the market "
+                        "charges more for far out-of-the-money options than the model says."
+                    )
